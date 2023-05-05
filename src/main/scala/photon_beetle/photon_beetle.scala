@@ -194,66 +194,129 @@ for (i <- 0 until D; j <- 0 until D) {
 io.stateOut := stateOut
 }
 
-/* class HASH extends Module {
+class Hash extends Module {
   val RATE_INBYTES = 8
+  val CRYPTO_BYTES = 8
+  val D = 8
+  val STATE_BYTES = D * D * CRYPTO_BYTES // Total number of bytes in the state
   val io = IO(new Bundle {
-    val state_inout = Input(Vec(8, Vec(8, UInt(8.W))))
+    val state_inout = Input(Vec(D, Vec(D, UInt(8.W))))
     val data_in = Input(Vec(RATE_INBYTES, UInt(8.W)))
     val dlen_inbytes = Input(UInt(64.W))
     val constant = Input(UInt(8.W))
-    val state_out = Output(Vec(8, Vec(8, UInt(8.W))))
+    val state_out = Output(Vec(D, Vec(D, UInt(8.W))))
   })
 
-  val photon = Module(new PhotonPermutation)
-  val xor = Module(new XOR)
-  val xorConst = Module(new XORConst)
+  // Instantiate sub-modules
+  val photon_permutation = Module(new PhotonPermutation())
+  val xor = Module(new XOR())
+  val xor_const = Module(new XORConst())
 
-  val D = 8
-  val state = Wire(Vec(D, Vec(D, UInt(4.W))))
-  for {
-    i <- 0 until D*D
-    row = i / D
-    col = i % D
-  } {
-    state(row)(col) := ((io.state_inout(row)(col) >> (4.U * (col % 2).U)) & 0xf.U)
-  }
-
-  val Dlen_inblocks = Wire(UInt(64.W))
-  Dlen_inblocks := (io.dlen_inbytes + RATE_INBYTES.U - 1.U) / RATE_INBYTES.U
-  val LastDBlocklen = Wire(UInt(64.W))
-
-  for {
-    i <- 0 until (Dlen_inblocks - 1.U).asBigInt
-    _ = photon.io.state_in := state
-    _ = xor.io.in_left := state.flatten
-    _ = xor.io.in_right := io.data_in
-  } {
-    state := photon.io.stateOut
-    io.state_out := VecInit(xorConst.io.out.grouped(D).map(_.asUInt()))
-  }
-
-  photon.io.state_in := state
-  xor.io.in_left := state.flatten
+  // Connect inputs of sub-modules
+  photon_permutation.io.state_in := io.state_inout
+  xor.io.in_left := VecInit(photon_permutation.io.stateOut.flatten).asTypeOf(Vec(8, UInt(8.W)))
   xor.io.in_right := io.data_in
-  state := photon.io.stateOut
+  xor_const.io.in := xor.io.out
+  xor_const.io.out <> io.state_out.flatten
 
-  LastDBlocklen := io.dlen_inbytes - (Dlen_inblocks - 1.U) * RATE_INBYTES.U
-  for {
-    i <- 0 until LastDBlocklen.asTypeOf(UInt(log2Up(RATE_INBYTES+1).W))
-    row = i / D
-    col = i % D
-  } {
-    state(row)(col) := state(row)(col) ^ io.data_in(i)
+  // Calculate the number of blocks and the last block length
+  val dlen_inblocks = (io.dlen_inbytes + RATE_INBYTES.U - 1.U) / RATE_INBYTES.U
+  val last_dblocklen = io.dlen_inbytes - (dlen_inblocks - 1.U) * RATE_INBYTES.U
+  
+  // Iterate over all blocks except the last one
+  for (i <- 0 until 15) {
+    photon_permutation.io.state_in := photon_permutation.io.stateOut
+    xor.io.in_left := VecInit(photon_permutation.io.stateOut.flatten).asTypeOf(Vec(8, UInt(8.W)))
+    xor.io.in_right := VecInit(io.data_in(i)(RATE_INBYTES-1, 0).asBools).asUInt.asTypeOf(Vec(8, UInt(8.W)))
+    //photon_permutation.io.stateOut := photon_permutation.io.stateOut
   }
 
-  when(LastDBlocklen < RATE_INBYTES.U) {
-    val idx = LastDBlocklen.toInt(UInt(log2Up(RATE_INBYTES+1).W))
-    state(idx / D.U)(idx % D.U) := state(idx / D.U)(idx % D.U) ^ 0x01.U
+  // Process the last block
+  photon_permutation.io.state_in := photon_permutation.io.stateOut
+  xor.io.in_left := photon_permutation.io.stateOut.flatten
+  val last_block_start = (dlen_inblocks - 1.U) * RATE_INBYTES.U
+  val last_block_end = io.dlen_inbytes.asTypeOf(UInt(log2Ceil(RATE_INBYTES).W)) + last_block_start
+  val last_block_mask = ((1.U << last_dblocklen.asUInt()) - 1.U) << (RATE_INBYTES.U - last_dblocklen.asUInt())
+
+  val data_in_bytes = VecInit(io.data_in.map(_.asUInt().asTypeOf(Vec(RATE_INBYTES, UInt(8.W))))) // Split data_in into individual bytes
+  val last_block_data_bytes = Wire(Vec(STATE_BYTES, UInt(8.W))) // Create a wire to hold the last block data bytes
+
+  for (i <- 0 until STATE_BYTES) {
+    val byte_index = (last_block_start * 8.U + i.U).asUInt() // Calculate the byte index for this iteration
+    last_block_data_bytes(i) := data_in_bytes(byte_index) // Get the byte from data_in_bytes and add it to last_block_data_bytes
   }
 
-  xorConst.io.in := state.flatten
-  io.state_out := VecInit(xorConst.io.out.grouped(D).map(_.grouped(D).toSeq.map(_.asUInt)))
-} */
+  val last_block_data = Cat(last_block_data_bytes.reverse) // Concatenate the bytes together to form the last_block_data signal
+  val masked_last_block_data = Mux(last_dblocklen === 0.U, 0.U, last_block_data & last_block_mask)
+  val padded_last_block_data = masked_last_block_data | (1.U << (last_dblocklen.asUInt() - 1.U))
+  xor.io.in_right := padded_last_block_data
+  photon_permutation.io.stateOut := photon_permutation.io.stateOut
+  // XOR with constant
+  xor_const.io.in := photon_permutation.io.stateOut.flatten
+  xor_const.io.out <> io.state_out
+  xor_const.io.out(last_dblocklen - 1.U) := xor_const.io.out(last_dblocklen - 1.U) ^ io.constant
+}
+
+class Tag extends Module {
+  val TAG_INBYTES = 64
+  val SQUEEZE_RATE_INBYTES = 8
+  val io = IO(new Bundle {
+    val tag_out = Output(Vec(TAG_INBYTES, UInt(8.W)))
+    val state_inout = Input(Vec(8, Vec(8, UInt(8.W))))
+  })
+
+  // Instantiate sub-modules
+  val photon_permutation = Module(new PhotonPermutation())
+  // Connect inputs of sub-modules
+  photon_permutation.io.state_in := io.state_inout
+  // Initialize tag_out index
+  var tag_out_idx = 0.U
+  // Process input state in blocks of SQUEEZE_RATE_INBYTES bytes
+  for (i <- 0 until TAG_INBYTES by SQUEEZE_RATE_INBYTES) {
+    // Permute state using PHOTON permutation
+    photon_permutation.io.state_in := io.state_inout
+    val state_out = photon_permutation.io.stateOut
+
+    // Copy SQUEEZE_RATE_INBYTES bytes of the permuted state to tag_out
+    for (j <- 0 until SQUEEZE_RATE_INBYTES) {
+      io.tag_out(tag_out_idx) := state_out(j / 8)(j % 8)
+      tag_out_idx = tag_out_idx + 1.U
+    }
+  }
+}
+
+class CryptoHash extends Module {
+  val RATE_INBYTES = 8
+  val CRYPTO_BYTES = 8
+  val D = 8
+  val STATE_BYTES = D * D * CRYPTO_BYTES // Total number of bytes in the state
+  val io = IO(new Bundle {
+    val data_in = Input(Vec(4096, UInt(8.W)))
+    val dlen_inbytes = Input(UInt(64.W))
+    val hash_out = Output(Vec(CRYPTO_BYTES, UInt(8.W)))
+  })
+
+  // Instantiate sub-modules
+  val hash = Module(new Hash())
+  val tag = Module(new Tag())
+  // Create the initial state
+  val initial_state = Wire(Vec(D, Vec(D, UInt(8.W))))
+  initial_state := VecInit(Seq.fill(D)(VecInit(Seq.fill(D)(0.U(8.W)))))
+
+  // Process input data
+  val blocks_in = io.data_in.grouped(RATE_INBYTES).toSeq // Group the input data into blocks of RATE_INBYTES bytes
+  val block_count = blocks_in.size
+  for (i <- 0 until block_count) {
+    hash.io.state_inout := initial_state
+    hash.io.data_in := blocks_in(i)
+    hash.io.dlen_inbytes := RATE_INBYTES.U
+    hash.io.constant := (if (i == block_count - 1) 0x07.U else 0x06.U)
+    initial_state := hash.io.state_out
+  }
+  // Compute the tag
+  tag.io.state_inout := initial_state
+  io.hash_out := tag.io.tag_out
+}
 
 
 class PHOTON_Beetle extends Module {
@@ -282,6 +345,9 @@ class PHOTON_Beetle extends Module {
   val subcell = Module(new SubCell())
   val photonPermutation = Module(new PhotonPermutation())
   val permutation = Module(new Permutation())
+  //val hash = Module(new Hash())
+  //val tag = Module(new Tag())
+  //val cryptoHash = Module(new CryptoHash())
 
   selectconst.io.condition := io.condition
   selectconst.io.option1 := io.option1
@@ -296,33 +362,42 @@ class PHOTON_Beetle extends Module {
   io.xor_out := xorConst.io.in
   io.RATE_INBYTES_out := xor.io.RATE_INBYTES_out
 
-  // Connect output of AddKey to input of sanityHASH
+  // Connect output of AddKey to input of Hash
   addkey.io.state := io.state_in
   addkey.io.round := io.round
   subcell.io.stateIn := addkey.io.out // connect output of AddKey to input of SubCell
 
-  printState.io.state := subcell.io.stateOut
-  photonPermutation.io.state_in := printState.io.state
-  addkey.io.in_key := io.addkey_in
+  // Connect output of SubCell to input of Hash
+  //hash.io.data_in := subcell.io.stateOut
+  //hash.io.constant := io.round
 
-  val wireRound = Wire(UInt(log2Ceil(12).W))
-  wireRound := io.round
-  permutation.io.round := wireRound
-  permutation.io.state_in := io.state_in
+  // Connect output of Hash to input of TAG
+ // tag.io.state_inout := hash.io.state_out
+
+  // Connect output of TAG to input of CryptoHash
+  //cryptoHash.io.data_in := tag.io.tag_out
+
 
   // Create two registers to delay the output of Permutation by two cycles
   val delayedStateOut1 = RegNext(permutation.io.state_out)
   val delayedStateOut2 = RegNext(delayedStateOut1)
 
-  io.state_out := delayedStateOut2
-
   // Connect the delayed output of Permutation to the input of PhotonPermutation
   photonPermutation.io.state_in := delayedStateOut2
+
+  addkey.io.in_key := io.addkey_in
+  val wireRound = Wire(UInt(log2Ceil(12).W))
+  wireRound := io.round
+  permutation.io.round := wireRound
+  permutation.io.state_in := io.state_in
+
+  io.state_out := delayedStateOut2
 
   // Connect output of PhotonPermutation to input of AddKey
   addkey.io.state := photonPermutation.io.stateOut
   io.addkey_out := addkey.io.out
 }
+
 
 
 object PHOTON_Beetle extends App {
